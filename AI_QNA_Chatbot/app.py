@@ -6,41 +6,38 @@ from langchain_community.document_loaders import PyPDFLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.llms import Ollama
 from langchain.chains import RetrievalQA
-from langchain.docstore.document import Document
 
 PDF_FOLDER = "pdfs"
 VECTOR_DB_PATH = "vector_store"
-EMBED_MODEL = "all-MiniLM-L6-v2"
 
-# -------------- Load & Split PDFs ---------------
+os.makedirs(PDF_FOLDER, exist_ok=True)
+
+# ----------------- Cache Functions -----------------
 @st.cache_resource
-def load_and_split_documents():
+def load_and_split_documents(uploaded_files=None):
     all_docs = []
+
+    # Load PDFs from static folder
     for filename in os.listdir(PDF_FOLDER):
         if filename.endswith(".pdf"):
             loader = PyPDFLoader(os.path.join(PDF_FOLDER, filename))
-            pages = loader.load()
-            all_docs.extend(pages)
+            all_docs.extend(loader.load())
+
+    # Handle newly uploaded files
+    if uploaded_files:
+        for file in uploaded_files:
+            file_path = os.path.join(PDF_FOLDER, file.name)
+            with open(file_path, "wb") as f:
+                f.write(file.getbuffer())
+            loader = PyPDFLoader(file_path)
+            all_docs.extend(loader.load())
 
     splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
-    split_docs = splitter.split_documents(all_docs)
-    return split_docs
-
-# -------------- Build or Load Vector Store -------
-# @st.cache_resource
-# def get_vectorstore(_documents):
-#     embeddings = HuggingFaceEmbeddings(model_name=EMBED_MODEL)
-#     if os.path.exists(VECTOR_DB_PATH):
-#         return FAISS.load_local(VECTOR_DB_PATH, embeddings, allow_dangerous_deserialization=True)
-#     else:
-#         vectorstore = FAISS.from_documents(_documents, embeddings)
-#         vectorstore.save_local(VECTOR_DB_PATH)
-#         return vectorstore
+    return splitter.split_documents(all_docs)
 
 @st.cache_resource
 def get_vectorstore(_documents):
     embeddings = HuggingFaceEmbeddings()
-
     faiss_index_path = os.path.join(VECTOR_DB_PATH, "index.faiss")
 
     if os.path.exists(faiss_index_path):
@@ -50,37 +47,75 @@ def get_vectorstore(_documents):
         vectorstore.save_local(VECTOR_DB_PATH)
         return vectorstore
 
-# -------------- Initialize LLM --------------------
 @st.cache_resource
 def get_llm():
-    return Ollama(model="mistral")  # Make sure `ollama run mistral` is working
+    return Ollama(model="mistral")
 
-# -------------- Build QA Chain --------------------
-@st.cache_resource
-def get_qa_chain():
-    docs = load_and_split_documents()
-    vectorstore = get_vectorstore(docs)
+def build_qa_chain(documents):
+    vectorstore = get_vectorstore(documents)
     retriever = vectorstore.as_retriever()
     llm = get_llm()
-    chain = RetrievalQA.from_chain_type(
+    return RetrievalQA.from_chain_type(
         llm=llm,
         retriever=retriever,
         return_source_documents=True
     )
-    return chain
 
-# -------------- Streamlit UI ---------------------
-st.set_page_config(page_title="HR Chatbot", page_icon="🤖")
-st.title("🤖 HR Chatbot")
-st.markdown("Ask your HR-related queries based on internal policy documents.")
+# ----------------- Streamlit UI -----------------
+st.set_page_config(page_title="AI/ML/GENAI QnA Chatbot", page_icon="🤖")
+st.title("🤖 AI/ML/GENAI QnA Chatbot")
+st.markdown("Ask your AI/ML questions. This chatbot answers from uploaded and existing PDFs.")
 
-query = st.text_input("Ask a question:")
-if query:
+# File uploader
+uploaded_files = st.file_uploader("📎 Upload PDFs (Optional):", type=["pdf"], accept_multiple_files=True)
+
+# Session state for chat
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = []
+
+# Question Input
+user_input = st.text_input("💬 Ask a question:")
+
+# ----------------- Main QA Logic -----------------
+if user_input:
     with st.spinner("Thinking..."):
-        qa_chain = get_qa_chain()
-        result = qa_chain(query)
-        st.success(result["result"])
+        documents = load_and_split_documents(uploaded_files)
+        qa_chain = build_qa_chain(documents)
+        result = qa_chain(user_input)
 
-        with st.expander("See source document chunks"):
-            for doc in result['source_documents']:
+        answer = result["result"]
+        sources = result.get("source_documents", [])
+
+        # Save in session
+        st.session_state.chat_history.append({
+            "question": user_input,
+            "answer": answer,
+            "sources": sources,
+            "feedback": None  
+        })
+
+        st.success(answer)
+
+        # Show source chunks
+        with st.expander("📄 Source Chunks"):
+            for doc in sources:
                 st.write(doc.page_content[:300] + "...")
+
+# ----------------- Chat History with Feedback -----------------
+if st.session_state.chat_history:
+    st.markdown("### 📝 Chat History")
+    for idx, entry in enumerate(reversed(st.session_state.chat_history), 1):
+        st.markdown(f"**{idx}. You:** {entry['question']}")
+        st.markdown(f"**🤖 Answer:** {entry['answer']}")
+
+        feedback_col1, feedback_col2 = st.columns(2)
+        with feedback_col1:
+            if st.toggle(f"👍 Helpful (Q{idx})", key=f"up_{idx}"):
+                entry["feedback"] = "👍"
+        with feedback_col2:
+            if st.toggle(f"👎 Not Helpful (Q{idx})", key=f"down_{idx}"):
+                entry["feedback"] = "👎"
+
+        # Optionally show feedback status
+        if entry["feedback"]:
+            st.markdown(f"**Feedback received:** {entry['feedback']}")
